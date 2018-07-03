@@ -101,8 +101,6 @@ func (t *TraderModule) ChargeOrdersOnce(ctx context.Context, symbol string, toke
 	limitChargeInSNMClone := big.NewInt(0).Set(limitChargeInSNM)
 	limitChargeInUSD := t.profit.ConvertingToUSDBalance(limitChargeInSNMClone, snm.GetPrice())
 
-	//limiter := 100.0 //сумма цен всех выставленных ордеров
-
 	mhashForToken, err := t.c.db.GetLastActualStepFromDb()
 	if err != nil {
 		t.c.logger.Error("cannot get last actual step from DB", zap.Error(err))
@@ -121,9 +119,8 @@ func (t *TraderModule) ChargeOrdersOnce(ctx context.Context, symbol string, toke
 	}
 
 	t.c.logger.Info("Start charge orders", zap.String("symbol ", symbol),
-		zap.String("limit for charge SNM :", sonm.NewBigInt(limitChargeInSNM).ToPriceString()),
-		zap.Float64("limit for charge USD :", limitChargeInUSD),
-		zap.Float64("pack price per month USD", pricePackMhInUSDPerMonth),
+		zap.String("limit balance for charge SNM :", sonm.NewBigInt(limitChargeInSNM).ToPriceString()),
+		zap.Float64("limit balance for charge USD :", limitChargeInUSD),
 		zap.Int64("sum orders per month", int64(sumOrdersPerMonth)),
 		zap.Float64("step", step),
 		zap.Int64("start", int64(start)),
@@ -134,8 +131,15 @@ func (t *TraderModule) ChargeOrdersOnce(ctx context.Context, symbol string, toke
 			t.c.logger.Info("charge is finished cause reached the limit", zap.Float64("charge destination", t.c.cfg.ChargeIntervalETH.Destination))
 			break
 		}
-		pricePerSecPack := t.FloatToBigInt(mhashForToken * pricePerSecMh)
-		zap.String("price", sonm.NewBigInt(pricePerSecPack).ToPriceString())
+
+		pricePerSecPack := t.FloatToBigInt(mhashForToken * (pricePerSecMh * t.c.cfg.Sensitivity.MarginAccounting))
+		pricePerSecPackWithoutMargin := t.FloatToBigInt(mhashForToken * (pricePerSecMh))
+		t.c.logger.Info("price",
+			zap.Float64("m-hashes", mhashForToken),
+			zap.Float64("price per sec for 1 Mh", pricePerSecMh),
+			zap.String("ending price with margin for pack", sonm.NewBigInt(pricePerSecPack).ToPriceString()),
+			zap.String("price without margin for pack", sonm.NewBigInt(pricePerSecPackWithoutMargin).ToPriceString()),
+		)
 		mhashForToken, err = t.ChargeOrders(ctx, symbol, pricePerSecPack, step, mhashForToken)
 		if err != nil {
 			return fmt.Errorf("cannot charging market! %v\r\n", err)
@@ -147,14 +151,17 @@ func (t *TraderModule) ChargeOrdersOnce(ctx context.Context, symbol string, toke
 // Prepare price and Map depends on token symbol. Create orders to the market, until the budget is over.
 func (t *TraderModule) ChargeOrders(ctx context.Context, symbol string, priceForHashPerSec *big.Int, step float64, buyMghash float64) (float64, error) {
 	requiredHashRate := uint64(buyMghash * hashes)
+
 	benchmarks, err := t.getBenchmarksForSymbol(symbol, uint64(requiredHashRate))
 	if err != nil {
 		return 0, err
 	}
+
 	buyMghash, err = t.CreateOrderOnMarketStep(ctx, step, benchmarks, buyMghash, priceForHashPerSec)
 	if err != nil {
 		return 0, err
 	}
+
 	return buyMghash, nil
 }
 
@@ -211,6 +218,7 @@ func (t *TraderModule) GetProfitForTokenBySymbol(tokens []*TokenMainData, symbol
 	return 0, fmt.Errorf("cannot get price from token! ")
 }
 
+//цена за 1 Mh/s
 func (t *TraderModule) GetPriceForTokenPerSec(token watchers.TokenWatcher, symbol string) (float64, float64, error) {
 	tokens, err := t.profit.CollectTokensMiningProfit(token)
 	if err != nil {
@@ -259,15 +267,6 @@ func (t *TraderModule) ReinvoiceOrder(ctx context.Context, cfg *Config, price *s
 		zap.String("price", sonm.NewBigInt(order.Price.Unwrap()).ToPriceString()),
 		zap.Uint64("hashrate", order.GetBenchmarks().GPUEthHashrate()))
 	return nil
-}
-
-func (t *TraderModule) cmpChangeOfPrice(change float64, def float64) (int32, error) {
-	if change >= 100+def {
-		return 1, nil
-	} else if change < 100-def {
-		return -1, nil
-	}
-	return 0, nil
 }
 
 func (t *TraderModule) OrdersProfitTracking(ctx context.Context, cfg *Config, actualPrice *big.Int, orderDb *database.OrderDb) error {
@@ -344,6 +343,46 @@ func (t *TraderModule) OrdersProfitTracking(ctx context.Context, cfg *Config, ac
 	return nil
 }
 
+func (t *TraderModule) DealsTrading(ctx context.Context, actualPrice *big.Int) error {
+	dealsDb, err := t.c.db.GetDealsFromDB()
+	if err != nil {
+		return fmt.Errorf("cannot get deals from DB %v\r\n", err)
+	}
+
+	for _, dealDb := range dealsDb {
+		if dealDb.Status != int64(sonm.DealStatus_DEAL_CLOSED) {
+			if dealDb.DeployStatus == int64(DeployStatusNOTDEPLOYED) {
+				err := t.ResponseToActiveDeals(ctx, dealDb, t.c.cfg.Images.Image)
+				if err != nil {
+					return err
+				}
+			} else if dealDb.DeployStatus == int64(DeployStatusDEPLOYED) && dealDb.ChangeRequestStatus != int64(sonm.ChangeRequestStatus_REQUEST_CREATED) {
+				if err := t.DeployedDealsProfitTrack(ctx, actualPrice, dealDb, t.c.cfg.Images.Image); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (t *TraderModule) OrdersTrading(ctx context.Context, actualPrice *big.Int) error {
+	orders, err := t.c.db.GetOrdersFromDB()
+	if err != nil {
+		return fmt.Errorf("cannot get orders from DB %v\r\n", err)
+	}
+	for _, order := range orders {
+		if order.ButterflyEffect != int64(OrderStatusCANCELLED) && order.OrderID != 0 {
+			err := t.OrdersProfitTracking(ctx, t.c.cfg, actualPrice, order)
+			if err != nil {
+				return fmt.Errorf("cannot start orders profit tracking: %v", err)
+			}
+		}
+	}
+	return nil
+}
+
 //Deploy new container + reinvoice order
 func (t *TraderModule) ResponseToActiveDeals(ctx context.Context, dealDb *database.DealDb, image string) error {
 	dealOnMarket, err := t.c.DealClient.Status(ctx, sonm.NewBigIntFromInt(dealDb.DealID))
@@ -351,13 +390,30 @@ func (t *TraderModule) ResponseToActiveDeals(ctx context.Context, dealDb *databa
 		return fmt.Errorf("cannot get deal info %v\r\n", err)
 	}
 
+	masterId := dealOnMarket.Deal.MasterID
+	val, err := t.c.db.GetMasterBlacklist(masterId.Unwrap().Hex())
+	if err != nil {
+		return err
+	}
+
+	if masterId.Unwrap().String() == val {
+		t.c.logger.Info("Master yet in blacklist",
+			zap.String("master Id", masterId.Unwrap().Hex()))
+		t.c.DealClient.Finish(ctx, &sonm.DealFinishRequest{
+			Id:            dealOnMarket.Deal.Id,
+			BlacklistType: 2,
+		})
+		t.c.db.UpdateDealStatusDb(dealDb.DealID, sonm.DealStatus_DEAL_CLOSED)
+	}
+
 	if dealOnMarket.Deal.Status == sonm.DealStatus_DEAL_CLOSED {
 		t.c.db.UpdateDealStatusDb(dealDb.DealID, sonm.DealStatus_DEAL_CLOSED)
 		return nil
 	}
 
-	t.c.logger.Info("Deploying new container",
+	t.c.logger.Info("deploying new container",
 		zap.String("deal id", dealOnMarket.Deal.Id.String()))
+
 	task, err := t.pool.DeployNewContainer(ctx, t.c.cfg, dealOnMarket.Deal, image)
 	if err != nil {
 		t.c.db.UpdateDeployStatusDealInDB(dealOnMarket.Deal.Id.Unwrap().Int64(), int64(DeployStatusNOTDEPLOYED))
@@ -365,19 +421,49 @@ func (t *TraderModule) ResponseToActiveDeals(ctx context.Context, dealDb *databa
 		return err
 	}
 
+	deployStatus, err := t.c.db.GetDeployStatus(dealDb.DealID)
+	if err != nil {
+		return err
+	}
+
+	if deployStatus == int64(DeployStatusDESTROYED) {
+		t.c.logger.Info("deploy status :: destroyed", zap.Int64("deal", dealDb.DealID))
+		bidOrder, err := t.c.Market.GetOrderByID(ctx, &sonm.ID{
+			Id: dealOnMarket.Deal.BidID.String(),
+		})
+		if err != nil {
+			return err
+		}
+		bench, err := t.GetBidBenchmarks(bidOrder)
+		if err != nil {
+			return fmt.Errorf("cannot get benchmarks from bid Order : %v\r\n", bidOrder.Id.Unwrap().Int64())
+		}
+
+		err = t.ReinvoiceOrder(ctx, t.c.cfg, &sonm.Price{PerSecond: dealOnMarket.Deal.Price}, bench, "ReOrder-destroyed deal")
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
 	if err := t.c.db.UpdateDeployStatusDealInDB(dealOnMarket.Deal.Id.Unwrap().Int64(), int64(DeployStatusDEPLOYED)); err != nil {
 		return err
 	}
 
-	t.c.logger.Info("New deployed task", zap.String("task", task.GetId()), zap.String("deal", dealOnMarket.Deal.GetId().String()))
+	t.c.logger.Info("new deployed task",
+		zap.String("task", task.GetId()),
+		zap.String("deal", dealOnMarket.Deal.GetId().String()))
+
 	bidOrder, err := t.c.Market.GetOrderByID(ctx, &sonm.ID{Id: dealOnMarket.Deal.GetBidID().String()})
 	if err != nil {
 		return fmt.Errorf("cannot get order by Id: %v\r\n", err)
 	}
+
 	bench, err := t.GetBidBenchmarks(bidOrder)
 	if err != nil {
 		return fmt.Errorf("cannot get benchmarks from bid Order : %v\r\n", bidOrder.Id.Unwrap().Int64())
 	}
+
 	if err := t.ReinvoiceOrder(ctx, t.c.cfg, &sonm.Price{PerSecond: dealOnMarket.Deal.GetPrice()}, bench, "Reinvoice(active deal)"); err != nil {
 		return fmt.Errorf("cannot reinvoice order %v", err)
 	}
@@ -503,18 +589,12 @@ func (t *TraderModule) GetChangeRequest(ctx context.Context, dealChangeRequest *
 }
 
 func (t *TraderModule) SaveNewActiveDealsIntoDB(ctx context.Context) error {
-	getDeals, err := t.c.DealClient.List(ctx, &sonm.Count{Count: 100})
+	deals, err := t.c.DealClient.List(ctx, &sonm.Count{Count: 100})
 	if err != nil {
 		return fmt.Errorf("Cannot get Deals list %v\r\n", err)
 	}
-	deals := getDeals.Deal
-	if len(deals) < 0 {
-		t.c.logger.Info("No active deals")
-		return nil
-	}
 
-	for _, deal := range deals {
-
+	for _, deal := range deals.Deal {
 		// todo: странная логика сохранения - сохранять не закрытые сделки
 		if deal.GetStatus() != sonm.DealStatus_DEAL_CLOSED {
 			t.c.db.SaveDealIntoDB(&database.DealDb{
@@ -530,21 +610,24 @@ func (t *TraderModule) SaveNewActiveDealsIntoDB(ctx context.Context) error {
 
 	return nil
 }
-func (t *TraderModule) UpdateDealsIntoDb(ctx context.Context) error {
-	dealsDb, err := t.c.db.GetDealsFromDB()
-	if err != nil {
-		return fmt.Errorf("cannot update deals into database %v ", err)
-	}
-	for _, d := range dealsDb {
-		getDeal, err := t.c.DealClient.Status(ctx, sonm.NewBigIntFromInt(d.DealID))
-		if err != nil {
-			return err
-		}
-		t.c.db.UpdateDealStatusDb(d.DealID, getDeal.Deal.Status)
-	}
-	//TODO: update price
-	return nil
-}
+
+//func (t *TraderModule) UpdateDealsIntoDb(ctx context.Context) error {
+//	dealsDb, err := t.c.db.GetDealsFromDB()
+//	if err != nil {
+//		return fmt.Errorf("cannot update deals into database %v ", err)
+//	}
+//	for _, d := range dealsDb {
+//		getDeal, err := t.c.DealClient.Status(ctx, sonm.NewBigIntFromInt(d.DealID))
+//		if err != nil {
+//			return err
+//		}
+//		err = t.c.db.UpdateDealStatusDb(d.DealID, getDeal.Deal.Status); if err!=nil{
+//			return err
+//		}
+//	}
+//	//TODO: update price
+//	return nil
+//}
 
 func (t *TraderModule) GetDeployedDeals() ([]int64, error) {
 	dealsDB, err := t.c.db.GetDealsFromDB()
@@ -629,18 +712,15 @@ func (t *TraderModule) CancelAllOrders(ctx context.Context) error {
 	}
 	return nil
 }
-
-
-func (t *TraderModule) CancelOrders(ctx context.Context) error{
+func (t *TraderModule) CancelOrders(ctx context.Context) error {
 	orders, err := t.c.db.GetOrdersFromDB()
 	if err != nil {
 		return fmt.Errorf("cannot get orders from DB %v\r\n", err)
 	}
 	for _, order := range orders {
-		if order.OrderID < 271{
-			t.c.Market.CancelOrder(ctx, &sonm.ID{strconv.Itoa(int(order.OrderID))})
-			t.c.logger.Info("cancelled", zap.Int64("id", order.OrderID))
-		}
+		t.c.Market.CancelOrder(ctx, &sonm.ID{strconv.Itoa(int(order.OrderID))})
+		t.c.logger.Info("cancelled", zap.Int64("id", order.OrderID))
+
 	}
 	return nil
 }

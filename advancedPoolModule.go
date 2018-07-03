@@ -27,6 +27,9 @@ func (p *PoolModule) AdvancedPoolHashrateTracking(ctx context.Context, reportedP
 	}
 
 	for _, w := range workers {
+		if w.BadGuy > 5 {
+			continue
+		}
 		if w.Iterations == 0 {
 			newIteration := w.Iterations + 1
 
@@ -43,9 +46,7 @@ func (p *PoolModule) AdvancedPoolHashrateTracking(ctx context.Context, reportedP
 			return err
 		}
 
-		if w.BadGuy > 5 {
-			continue
-		}
+
 
 		dealInfo, err := p.c.DealClient.Status(ctx, sonm.NewBigInt(big.NewInt(0).SetInt64(w.DealID)))
 		if err != nil {
@@ -167,10 +168,11 @@ func (p *PoolModule) SendToConnorBlackList(ctx context.Context, failedDeal *sonm
 	}
 
 	for _, wM := range workerList.Workers {
-		val, err := p.c.db.GetBlacklistFromDb(wM.SlaveID.Unwrap().Hex())
+		val, err := p.c.db.GetFailSupplierFromBlacklistDb(wM.SlaveID.Unwrap().Hex())
 		if err != nil {
 			return err
 		}
+
 		if val == wM.SlaveID.Unwrap().Hex() {
 			continue
 		} else {

@@ -277,7 +277,8 @@ func (d *Database) GetOrdersFromDB() ([]*OrderDb, error) {
 	}
 	return orders, err
 }
-func (d *Database) GetBlacklistFromDb(failSupplierID string) (string, error) {
+
+func (d *Database) GetFailSupplierFromBlacklistDb(failSupplierID string) (string, error) {
 	rows, err := d.connect.Query(getSupplierIDFromBlackList, failSupplierID)
 	if err != nil {
 		return "", err
@@ -293,6 +294,24 @@ func (d *Database) GetBlacklistFromDb(failSupplierID string) (string, error) {
 	}
 	return "", nil
 }
+
+func (d *Database) GetMasterBlacklist(masterId string) (string, error) {
+	rows, err := d.connect.Query(getMasterIDFromBlackList, masterId)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var masterId string
+		err = rows.Scan(&masterId)
+		if err != nil {
+			return "", err
+		}
+		return masterId, nil
+	}
+	return "", nil
+}
+
 
 func (d *Database) GetWorkerFromPoolDb(dealID string) (string, error) {
 	rows, err := d.connect.Query(getWorkerIDFromPool, dealID)
@@ -324,6 +343,23 @@ func (d *Database) GetChangeRequestStatus(dealId int64)(int64, error){
 			return 0, err
 		}
 		return changeRequestStatus, nil
+	}
+	return 0, nil
+}
+
+func (d *Database) GetDeployStatus (dealId int64)(int64, error){
+	rows, err := d.connect.Query(getDeployStatusStatus, dealId)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var deployStatus int64
+		err = rows.Scan(&deployStatus)
+		if err != nil {
+			return 0, err
+		}
+		return deployStatus, nil
 	}
 	return 0, nil
 }

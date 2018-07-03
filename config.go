@@ -72,7 +72,7 @@ type typicalBenchmark struct {
 }
 type tickerConfig struct {
 	// TODO: лучше сделать время
-	TradeTicker int64 `yaml:"trade_tickers"`
+	TradeTicker int64 `yaml:"trade_ticker"`
 	DataUpdate  int64 `yaml:"data_update"`
 	PoolInit    int64 `yaml:"pool_init"`
 }

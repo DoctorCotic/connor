@@ -38,8 +38,8 @@ const (
 func (p *PoolModule) DeployNewContainer(ctx context.Context, cfg *Config, deal *sonm.Deal, image string) (*sonm.StartTaskReply, error) {
 	env := map[string]string{
 		"ETH_POOL": EthPool,
-		"WALLET":   cfg.PoolAddress.EthPoolAddr,
 		"WORKER":   deal.Id.String(),
+		"WALLET":   p.c.cfg.PoolAddress.EthPoolAddr,
 		"EMAIL":    p.c.cfg.OtherParameters.EmailForPool,
 	}
 	container := &sonm.Container{
@@ -55,9 +55,32 @@ func (p *PoolModule) DeployNewContainer(ctx context.Context, cfg *Config, deal *
 		DealID: deal.GetId(),
 		Spec:   spec,
 	}
+
 	reply, err := p.c.TaskClient.Start(ctx, startTaskRequest)
 	if err != nil {
-		return nil, fmt.Errorf("cannot create start task request %s", err)
+
+		p.c.logger.Info("Cannot create start task with given container Deal closed.",
+			zap.String("deal", deal.Id.Unwrap().String()),
+			zap.Error(err), )
+
+		if deal.Status != sonm.DealStatus_DEAL_CLOSED {
+			_, err := p.c.DealClient.Finish(ctx, &sonm.DealFinishRequest{
+				Id: deal.Id,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("cannot finished deal %v", err)
+			}
+			p.c.logger.Info("deal finished!", zap.Int64("deal", deal.Id.Unwrap().Int64()))
+		} else {
+			p.c.logger.Info("deal finished yet from worker", zap.Int64("deal", deal.Id.Unwrap().Int64()))
+		}
+
+		err = p.c.db.UpdateDeployStatusDealInDB(deal.Id.Unwrap().Int64(), int64(DeployStatusDESTROYED))
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, nil
 	}
 	return reply, nil
 }
@@ -216,8 +239,7 @@ func (p *PoolModule) DestroyDeal(ctx context.Context, dealInfo *sonm.DealInfoRep
 		Id:            dealInfo.Deal.Id,
 		BlacklistType: sonm.BlacklistType_BLACKLIST_MASTER,
 	}); err != nil {
-		p.c.logger.Error("couldn't finish deal", zap.String("deal", dealInfo.Deal.Id.String()), zap.Error(err))
-		return err
+		p.c.logger.Info("couldn't finish deal", zap.String("deal", dealInfo.Deal.Id.String()), zap.Error(err))
 	}
 	err := p.c.db.SetDestroyDealPoolDB(int64(DeployStatusDESTROYED), dealInfo.Deal.Id.Unwrap().Int64())
 	if err != nil {
@@ -225,6 +247,10 @@ func (p *PoolModule) DestroyDeal(ctx context.Context, dealInfo *sonm.DealInfoRep
 	}
 	err = p.c.db.UpdateBadGayStatusInPoolDB(dealInfo.Deal.Id.Unwrap().Int64(), int64(BanStatusWORKERINPOOL), time.Now())
 	if err != nil {
+		return err
+	}
+	err = p.c.db.UpdateDealStatusDb(dealInfo.Deal.Id.Unwrap().Int64(), sonm.DealStatus_DEAL_CLOSED)
+	if err !=nil{
 		return err
 	}
 	p.c.logger.Info("destroyed deal", zap.String("deal", dealInfo.Deal.Id.Unwrap().String()))

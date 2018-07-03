@@ -7,16 +7,15 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/sonm-io/core/proto"
-	"github.com/sonm-io/core/util"
-	"github.com/sonm-io/core/util/xgrpc"
-	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc/credentials"
-
 	"github.com/noxiouz/zapctx/ctxlog"
 	"github.com/sonm-io/core/connor/database"
 	"github.com/sonm-io/core/connor/watchers"
+	"github.com/sonm-io/core/proto"
+	"github.com/sonm-io/core/util"
+	"github.com/sonm-io/core/util/xgrpc"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/credentials"
 )
 
 const (
@@ -87,9 +86,9 @@ func (c *Connor) Serve(ctx context.Context) error {
 
 	c.ClearStart()
 
-	dataUpdate := time.NewTicker(time.Duration(c.cfg.Tickers.DataUpdate) * time.Second)
+	dataUpdate := util.NewImmediateTicker(time.Duration(c.cfg.Tickers.DataUpdate) * time.Second)
 	defer dataUpdate.Stop()
-	tradeUpdate := time.NewTicker(time.Duration(c.cfg.Tickers.TradeTicker) * time.Second)
+	tradeUpdate := util.NewImmediateTicker(time.Duration(c.cfg.Tickers.TradeTicker) * time.Second)
 	defer tradeUpdate.Stop()
 	poolInit := time.NewTicker(time.Duration(c.cfg.Tickers.PoolInit) * time.Second)
 	defer poolInit.Stop()
@@ -99,7 +98,6 @@ func (c *Connor) Serve(ctx context.Context) error {
 	reportedPool := watchers.NewPoolWatcher(poolReportedHashRate, []string{c.cfg.PoolAddress.EthPoolAddr})
 	avgPool := watchers.NewPoolWatcher(poolAverageHashRate, []string{c.cfg.PoolAddress.EthPoolAddr + "/1"})
 
-	// straight update of all watchers
 	if err := snm.Update(ctx); err != nil {
 		return fmt.Errorf("cannot update snm data: %v", err)
 	}
@@ -112,6 +110,7 @@ func (c *Connor) Serve(ctx context.Context) error {
 	if err := avgPool.Update(ctx); err != nil {
 		return fmt.Errorf("cannot update avgPool data: %v", err)
 	}
+
 	profitModule := NewProfitableModules(c)
 	poolModule := NewPoolModules(c)
 	traderModule := NewTraderModules(c, poolModule, profitModule)
@@ -120,11 +119,9 @@ func (c *Connor) Serve(ctx context.Context) error {
 	//if err != nil {
 	//	return err
 	//}
-
 	md := errgroup.Group{}
 	//md.Go(func() error {
-	//	//return traderModule.ChargeOrdersOnce(ctx, c.cfg.UsingToken.Token, token, snm, balanceReply)
-	//	return traderModule.CancelOrders(ctx)
+	//	return traderModule.ChargeOrdersOnce(ctx, c.cfg.UsingToken.Token, token, snm, balanceReply)
 	//})
 
 	for {
@@ -145,15 +142,10 @@ func (c *Connor) Serve(ctx context.Context) error {
 				return avgPool.Update(ctx)
 			})
 		case <-tradeUpdate.C:
-			c.logger.Info("start trade module hashrate tracking")
 
 			err := traderModule.SaveNewActiveDealsIntoDB(ctx)
 			if err != nil {
 				return fmt.Errorf("cannot save active deals : %v", err)
-			}
-
-			if err := traderModule.UpdateDealsIntoDb(ctx); err != nil {
-				return err
 			}
 
 			_, pricePerSec, err := traderModule.GetPriceForTokenPerSec(token, c.cfg.UsingToken.Token)
@@ -161,47 +153,18 @@ func (c *Connor) Serve(ctx context.Context) error {
 				return fmt.Errorf("cannot get pricePerSec for token per sec %v", err)
 			}
 
-			actualPrice := traderModule.FloatToBigInt(pricePerSec)
+			actualPrice := traderModule.FloatToBigInt(pricePerSec * c.cfg.Sensitivity.MarginAccounting)
 			if actualPrice == big.NewInt(0) {
 				return fmt.Errorf("actual price is 0")
 			}
 
-			c.logger.Info("new actual price hashes per sec", zap.String("price", sonm.NewBigInt(actualPrice).ToPriceString()))
+			md.Go(func() error {
+				return traderModule.DealsTrading(ctx, actualPrice)
+			})
+			md.Go(func() error {
+				return traderModule.OrdersTrading(ctx, actualPrice)
+			})
 
-			dealsDb, err := traderModule.c.db.GetDealsFromDB()
-			if err != nil {
-				return fmt.Errorf("cannot get deals from DB %v\r\n", err)
-			}
-
-			for _, dealDb := range dealsDb {
-				if dealDb.Status != int64(sonm.DealStatus_DEAL_CLOSED) {
-					if dealDb.DeployStatus == int64(DeployStatusNOTDEPLOYED) {
-
-						c.logger.Info("Response to active deals")
-
-						if err := traderModule.ResponseToActiveDeals(ctx, dealDb, c.cfg.Images.Image); err != nil {
-							return err
-						}
-					} else if dealDb.DeployStatus == int64(DeployStatusDEPLOYED) && dealDb.ChangeRequestStatus != int64(sonm.ChangeRequestStatus_REQUEST_CREATED) {
-						if err := traderModule.DeployedDealsProfitTrack(ctx, actualPrice, dealDb, c.cfg.Images.Image); err != nil {
-							return err
-						}
-					}
-				}
-			}
-
-			orders, err := traderModule.c.db.GetOrdersFromDB()
-			if err != nil {
-				return fmt.Errorf("cannot get orders from DB %v\r\n", err)
-			}
-			for _, order := range orders {
-				if order.ButterflyEffect != int64(OrderStatusCANCELLED) {
-					err := traderModule.OrdersProfitTracking(ctx, c.cfg, actualPrice, order)
-					if err != nil {
-						return fmt.Errorf("cannot start orders profit tracking: %v", err)
-					}
-				}
-			}
 		case <-poolInit.C:
 			c.logger.Info("start pool module hashrate tracking")
 
@@ -228,6 +191,7 @@ func (c *Connor) Serve(ctx context.Context) error {
 			}
 		}
 	}
+	return nil
 }
 
 func (c *Connor) ClearStart() error {

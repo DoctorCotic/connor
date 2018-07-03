@@ -22,10 +22,12 @@ const (
 
 	getCountFromDb                  = "SELECT COUNT(ID) AS count FROM ORDERS"
 	getSupplierIDFromBlackList      = "SELECT FAIL_SUPPLIER_ID FROM BLACKLIST WHERE FAIL_SUPPLIER_ID = ?"
+	getMasterIDFromBlackList        = "SELECT MASTER_ID FROM BLACKLIST WHERE MASTER_ID = ?"
 	getWorkerIDFromPool             = "SELECT DEAL_ID from POOLS WHERE DEAL_ID = ?"
 	getCountSupplierIDFromBlackList = "SELECT COUNT(FAIL_SUPPLIER_ID) as count from BLACKLIST WHERE MASTER_ID = ?"
 	getLastActualStep               = "SELECT MAX(ACTUAL_STEP) AS max FROM ORDERS WHERE BUTTERFLY_EFFECT = 2"
 	getChangeRequestStatus          = "SELECT CHANGE_REQUEST_STATUS from DEALS WHERE ID = ?"
+	getDeployStatusStatus           = "SELECT DEPLOY_STATUS from DEALS WHERE ID = ?"
 
 	getOrders          = "SELECT * FROM ORDERS"
 	getDeals           = "SELECT * FROM DEALS"
